@@ -1,0 +1,1354 @@
+#Single-cell Analysis of Similarity Between Kidney Organoids and Human Kidneys
+#Dissertation of Bachelor Degree of School of Life Sceinces
+#20185097 Eunsue Shin
+#
+#본 스크립트는 한글과 영어가 혼용되어있습니다.
+#Script for basic scRNA-seq analysis using seurat and for making figures
+#script내용은 논문내용에 포함된 그리고 추가적으로 진행했던 seurat 패키지를 활용한 싱글셀 분석과 figure 제작에 사용된 코드들입니다.
+#first part is script for basic analysis
+#첫 파트는 싱글셀 분석에서 빠지지않고 기본적으로 진행하는 데이터 처리부분입니다.
+#sequential part is script for making figures
+#그 뒤로, 분석을 진행하고 마지막으로 피규어 제작에 사용된 코드가 있습니다.
+#Basically we used our own script for analysis but we were also aided from script of other published papers
+#기본적으로 직접 코드를 작성하였지만 부분부분 다른 논문에서 차용한 함수나 코드등이 섞여있습니다.
+#다른 곳에서 발췌한 코드이기에 아래에 러퍼런스로 원 논문과 그들이 남겨둔 script 주소를 표기합니다.
+#We state the source of script of references we used
+# Ref.1 : Muto, Y., Wilson, P.C., Ledru, N. et al. Single cell transcriptional and chromatin accessibility profiling redefine cellular heterogeneity in the adult human kidney. Nat Commun 12, 2190 (2021).
+# Ref.1 script : https://github.com/p4rkerw/Muto_Wilson_NComm_2020
+# Ref.2 : Combes, A.N., Zappia, L., Er, P.X. et al. Single-cell analysis reveals congruence between kidney organoids and human fetal kidney. Genome Med 11, 3 (2019).
+# Ref.2 script : https://github.com/p4rkerw/Muto_Wilson_NComm_2020
+# Ref.3 : Miao, Z., Balzer, M.S., Ma, Z. et al. Single cell regulatory landscape of the mouse kidney highlights cellular differentiation programs and disease targets. Nat Commun 12, 2277 (2021).
+# Ref.3 script : https://github.com/Zhen-Miao/dev-kidney-snATAC/tree/main/R
+#
+#
+#
+#
+.libPaths("/home/qkrtltm100/R_packages")
+install.packages('tidyverse')
+library(Seurat)
+library(SeuratWrappers)
+library(SeuratData)
+library(SeuratObject)
+library(monocle)
+library(data.table)
+library(patchwork)
+library(ggplot2)
+library(sctransform)
+library(dplyr)
+library(purrr)
+library(forcats)
+library(here)
+library(Matrix)
+library(Rcpp)
+library(DoubletFinder)
+library(openxlsx)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(glue)
+library(knitr)
+library(jsonlite)
+library(reticulate)
+
+setwd('/home/qkrtltm100/FastQ/Alter')
+outs <- "/home/qkrtltm100/FastQ/CellRangerAggr/kidney/All_SN/outs/outs/"
+# load aggregated snRNAseq&scRNAseq data from cellranger aggregate matrix and create seurat objects
+counts <- Read10X(here(outs,"filtered_feature_bc_matrix"))
+metadata <- read.csv(here(outs,"aggregation.csv"))
+rnaAggr <- CreateSeuratObject(counts = counts, min.cells = 2, min.features = 200, 
+                              project = "kid_AGGR")
+# extract GEM groups from individual barcodes using string split and the suffix integer
+# use the GEM groups to assign sample origin (kidney organoids, fetal kidney, and adult kidney) from the aggregation.csv metadata
+# files were aggregated 7 kidney organoids, 4 fetal kidneys, and 3 adult kidneys
+gemgroup <- sapply(strsplit(rownames(rnaAggr@meta.data), split="-"), "[[", 2) 
+head(rownames(rnaAggr@meta.data))
+#abcd 순으로 정렬되니 주의
+current.gemgroups <- seq(1, length(levels(metadata$library_id)))
+orig.ident <- levels(metadata$library_id)
+orig.ident <- c( "AY_AS_D29", "COM_D25", "HOW_DAY25", "HUM_WK17", 'HUM_SN1', 'HUM_SN2', 'HUM_SN3', "HUM_WK13", "HUM_WK18", 'HUM_WK9', "JH_DAY10", "KUM_D25", "LAW_D25", "VAN_D20") #adjust sample names
+sampleID <- plyr::mapvalues(gemgroup, from = current.gemgroups, to = orig.ident)
+rnaAggr <- AddMetaData(object=rnaAggr, metadata=data.frame(orig.ident=sampleID, row.names=rownames(rnaAggr@meta.data)))
+rnaAggr <- PercentageFeatureSet(rnaAggr, pattern = "^MT-", col.name = "percent.mt")
+rnaAggr <- PercentageFeatureSet(rnaAggr, pattern = "^RPL", col.name = "percent.rpl")
+rnaAggr <- PercentageFeatureSet(rnaAggr, pattern = "^RPS", col.name = "percent.rps")
+VlnPlot(object = rnaAggr, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, group.by = "orig.ident",pt.size=0.1)
+VlnPlot(object = rnaAggr, features = c("percent.rps", "percent.rpl"), ncol = 2, group.by = "orig.ident",pt.size=0.1)
+# filter the aggregated dataset for low quality cells
+rnaAggr <- subset(rnaAggr, subset = nFeature_RNA > 200 # use same filter parameters as aggr
+                  & nFeature_RNA < 4000
+                  & percent.mt < 60)
+
+# Doublet removal with the assumption that doublets represent 6% of cells.
+## Pre-process Seurat object (standard) --------------------------------------------------------------------------------------
+FindDoublets <- function(library_id, seurat_aggregate) {
+  rnaAggr <- seurat_aggregate
+  seurat_obj <- subset(rnaAggr, idents = library_id)
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- ScaleData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 1000)
+  seurat_obj <- RunPCA(seurat_obj)
+  # ElbowPlot(seurat_obj)
+  seurat_obj <- FindNeighbors(seurat_obj, dims = 1:20)
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:20)
+  DimPlot(seurat_obj)
+  ## pK Identification (no ground-truth) ---------------------------------------------------------------------------------------
+  sweep.res.list_kidney <- paramSweep_v3(seurat_obj, PCs = 1:20, sct = F)
+  sweep.stats_kidney <- summarizeSweep(sweep.res.list_kidney, GT = FALSE)
+  bcmvn_kidney <- find.pK(sweep.stats_kidney)
+  pK <- bcmvn_kidney %>% # select the pK that corresponds to max bcmvn to optimize doublet detection
+    filter(BCmetric == max(BCmetric)) %>%
+    select(pK) 
+  pK <- as.numeric(as.character(pK[[1]]))
+  seurat_doublets <- doubletFinder_v3(seurat_obj, PCs = 1:20, pN = 0.25, pK = pK,
+                                      nExp = round(0.05*length(seurat_obj@active.ident)), 
+                                      reuse.pANN = FALSE, sct = F)
+  
+  # create doublet groupings and visualize results
+  DF.class <- names(seurat_doublets@meta.data) %>% str_subset("DF.classifications")
+  pANN <- names(seurat_doublets@meta.data) %>% str_subset("pANN")
+  
+  p1 <- ggplot(bcmvn_kidney, aes(x=pK, y=BCmetric)) +
+    geom_bar(stat = "identity") + 
+    ggtitle(paste0("pKmax=",pK)) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  p2 <- DimPlot(seurat_doublets, group.by = DF.class)
+  p3 <- FeaturePlot(seurat_doublets, features = pANN)
+  
+  outFile <- paste0("doublets.",library_id,".pdf")
+  dir.create("plots", showWarnings = FALSE)
+  pdf(here("plots",outFile))
+  print(p1) # need to use print() when drawing pdf in a function call
+  print(p2)
+  print(p3)
+  dev.off()
+  
+  # create a df of barcodes and doublet designations
+  df_doublet_barcodes <- as.data.frame(cbind(rownames(seurat_doublets@meta.data), seurat_doublets@meta.data[[DF.class]]))
+  return(df_doublet_barcodes)
+}
+Idents(rnaAggr) <- "orig.ident"
+list.doublet.bc <- lapply(orig.ident, function(x) {FindDoublets(x, seurat_aggregate = rnaAggr)})
+doublet_id <- list.doublet.bc %>%
+  bind_rows() %>%
+  dplyr::rename("doublet_id" = "V2") %>%
+  tibble::column_to_rownames(var = "V1") # this is the barcode column
+table(doublet_id) # quantify total doublet vs. singlet calls (expect ~5% doublets)
+
+# add doublet calls to aggregated sc/snRNA object as doublet_id in meta.data slot
+rnaAggr <- AddMetaData(rnaAggr,doublet_id)
+
+# filter out doublets prior to sc/snRNA preprocessing
+Idents(rnaAggr) <- "doublet_id"
+rnaAggr <- subset(rnaAggr,idents = "Singlet")
+save(rnaAggr, file = 'rnaAggr.ALL.SN.Bf.pr.RData') # singlet 67925, doublet 3576
+# Basic Seurat object data processing procedure
+rnaAggr <- NormalizeData(rnaAggr)
+rnaAggr <- FindVariableFeatures(rnaAggr, selection.method = 'vst', nfeatures = 1000, verbose = F)
+all.gene <- rownames(rnaAggr)
+save(rnaAggr, file = 'rnaAggr.ALL.SN.af.scale.RData')
+rnaAggr <- ScaleData(rnaAggr, vars.to.regress = c('nCount_RNA', 'percent.mt'), verbose = T, features = all.gene)
+rnaAggr <- RunPCA(rnaAggr, npcs = 30, verbose = T)
+rnaAggr <- RunUMAP(rnaAggr, reduction = 'pca', dims = 1:30)
+rnaAggr <- FindNeighbors(rnaAggr, reduction = 'pca', dims = 1:30)
+rnaAggr <- FindClusters(rnaAggr, resolution = 1)
+DimPlot(rnaAggr, group.by = 'orig.ident') + DimPlot(rnaAggr) #umap reduction plot before removing batch effect 
+save(rnaAggr, file = 'rnaAggr.ALL.SN.bf.batch.RData')
+
+#remove batch effect
+rnaAggr.all <- RunFastMNN(object.list = SplitObject(rnaAggr, split.by = "orig.ident"))
+rnaAggr.all <- RunUMAP(rnaAggr.all, reduction = "mnn", dims = 1:30)
+rnaAggr.all <- FindNeighbors(rnaAggr.all, reduction = "mnn", dims = 1:30)
+rnaAggr.all <- FindClusters(rnaAggr.all, resolution = 1)
+save(rnaAggr.all, file = 'rnaAggr.all.ALL.SN.RData')
+DimPlot(rnaAggr.all, group.by = 'orig.ident') +DimPlot(rnaAggr.all, label = T, label.size = 3) #umap reduction plot for check removal of batch effect 
+
+##combining with adult kidney
+load('/home/qkrtltm100/FastQ/Mature_Full_v2.1_Seurat.RData')
+DimPlot(hKidney)
+Idents(hKidney) <- hKidney$celltype
+#combined seurat object combined with aggr samples and pulblished adult kidney sample
+kidney.list <- c(hKidney, rnaAggr.all)
+features <- SelectIntegrationFeatures(object.list = kidney.list)
+kidney.anchors <- FindIntegrationAnchors(object.list = kidney.list, anchor.features = features)
+kidney.combined <- IntegrateData(anchorset = kidney.anchors)
+save(kidney.combined, file = 'kidney.combined.bf.pr.RData')
+DefaultAssay(kidney.combined) <- 'integrated'
+#check correlation between aggr sample and pulbished sample by going through basic seurat process
+kidney.combined <- ScaleData(kidney.combined)
+kidney.combined <- RunPCA(kidney.combined, npcs = 30, verbose = T)
+kidney.combined <- RunUMAP(kidney.combined, reduction = 'pca', dims = 1:30)
+kidney.combined <- FindNeighbors(kidney.combined, reduction = 'pca', dims = 1:30)
+kidney.combined <- FindClusters(kidney.combined, resolution = 1)
+DimPlot(kidney.combined, label = T, label.size = 3)  + DimPlot(kidney.combined, group.by = 'SampleID') # umap reduction plot for check corrleation between samples
+save(kidney.combined, file = 'rnaAggr.all.ALL+hKIdney.bf.anno.RData')
+#add annotation data from each sample
+tail(colnames(kidney.combined))
+aa <- colnames(kidney.combined)
+aa <- as.data.frame(aa)
+table(rnaAggr.all$orig.ident)
+write.csv(aa, file = 'col.csv')
+write.csv(aa, file = 'hkidney.idents.csv')
+aa <- hKidney$celltype
+abc <- read.csv(file = 'col.csv', header = T, row.names = 'Barcodes')
+abb <- read.csv(file = 'all+hkidney.Celltype.csv', header = T, row.names = 'Barcodes')
+kidney.combined[['SampleID']] <- abc
+kidney.combined[['Celltypes']] <- abb
+Idents(kidney.combined) <- kidney.combined$Celltypes
+save(kidney.combined, file = 'rnaAggr.all.ALL+hKIdney.af.anno.RData')
+
+##marker gene selection
+SN.marker <- read.csv(file = 'SN_kidney marker.csv', header = T)
+SC.marker <- read.csv(file = 'SC_kidney_marker.csv', header = T)
+Fet.marker <- read.csv(file = 'Fet_Kidney.marker.csv', header = T)
+org.marker <- read.csv(file = 'ORG.marker.csv', header = T) #use four marker gene references
+
+a <- as.character(org.marker$MESS3) #Repeat by each cell type in four references
+FeaturePlot(rnaAggr.all, features = a)
+VlnPlot(rnaAggr.all, features = a, pt.size = 0.1) #make Feature plot and viloin plot for all celltypes
+#first annotation
+#annotation is conducted based on gene expression data of reference celltypes
+rnaAggr.all <- RenameIdents(object = rnaAggr.all, '0'='aFIB+oStroma+fIC', '1'='fIC+oStroma', '2'='fIC+oStroma2', '8'='aPEC+fREN+IC/IC/oStroma', '6'='fIC_Prog+oStroma', '5'='oStroma+CC', '7'='fIC+CC', '9'='fPTA',  '20'='fPTA2', '12'='fPTA+CC', '3'='Podo', '4'='Podo+fPTA', '11'='aPT', '13'='PT+fUBCD', '14'='fUE/CNT/UBCD+oLH', '15'='aTAL+fDT', '16'='aDCT', '17'='Endo', '18'='aCNT+aPC', '10'='aPT(VCAM1)/PEC+Endo',  '19'='aICA+B','21'='Muscle_Prog')
+#marker genes from each celltypes, About 2 genes were selected from each cell type
+markergene1 <- c('SERPINE1', 'SYNPO2', 'MFAP4', 'POSTN', 'LGALS1', 'PTPRO', 'NPHS2', 'IGFBP7', 'PCP4', 'LUM', 'OGN', "MIA", 'COL2A1', "EPYC", 'TOP2A', 'CENPF', 'CFH', 'TNC', 'REN', 'ACTA2', 'SRGN', 'HLA-DRA', 'VCAM1', 'CRYAB', 'FLT1', 'EMCN', 'PLVAP', 'CUBN', 'ACSM2A', 'LYPD1', 'DAPL1', 'EMX2', 'PAX8', 'MT1G', 'AFP', 'CLDN4', 'KRT8', 'MAL', 'SLC12A1', 'UMOD', 'TRPM6', 'CNNM2', 'KDR', 'CD34', 'SLC8A1', 'TEX41', 'GATA3', 'AQP2', 'CLNK', 'MYLPF', 'MYL1')
+
+#제대로 annotation및 마커선정이 잘 되었는지 확인
+rnaAggr.all <- NormalizeData(rnaAggr.all)
+DotPlot(rnaAggr.all, features = markergene, cols = c('lightgrey', 'red')) +RotatedAxis()
+DotPlot(rnaAggr.all, features = markergene1, cols = c('red', 'blue', 'green'), split.by = 'SampleType') +RotatedAxis()
+
+#seperate by sample type
+#sampletype별로 나누어서 어떻게 나누어졌나 확인합니다.
+sampletype <- as.data.frame(rnaAggr.all$orig.ident)
+write.csv(sampletype, file = 'ALL.SN.orig.ident.csv')
+a <- read.csv(file = 'ALL.SN.sample.type.csv', header = T, row.names = 'Barcodes')
+rnaAggr.all[['SampleType']] <- a
+DimPlot(rnaAggr.all, group.by = 'SampleType')
+rnaA1 <- rnaAggr.all
+rnaA1@assays$RNA@scale.data <- rnaAggr@assays$RNA@scale.data
+DoHeatmap(object = rnaA1, features = markergene1)
+DimHeatmap(object = rnaA1, features = markergene1)
+DoHeatmap(rnaA1, features = markergene1, cells = 1:500, size = 4,
+          angle = 90) + NoLegend()
+##highlight each sampletype
+#sample별로 전체 umap plot상에 어디에 존재하는지 강조하였습니다.
+adult <- subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[rnaAggr.all$orig.ident %in% c('HUM_SN1', 'HUM_SN2', 'HUM_SN3')]))
+Fetal <- subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[rnaAggr.all$orig.ident %in% c('HUM_WK17', 'HUM_WK13', 'HUM_WK9', 'HUM_WK18')]))
+Org <- subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[!rnaAggr.all$orig.ident %in% c('HUM_WK17', 'HUM_WK13', 'HUM_WK9', 'HUM_WK18', 'HUM_SN1', 'HUM_SN2', 'HUM_SN3')]))
+AS <- subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[rnaAggr.all$orig.ident %in% 'AY_AS_D29'])) 
+COM <- subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[rnaAggr.all$orig.ident %in% 'COM_D25']))
+HOW <- subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[rnaAggr.all$orig.ident %in% 'HOW_DAY25']))
+JH <- subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[rnaAggr.all$orig.ident %in% 'JH_DAY10']))
+KUM <- subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[rnaAggr.all$orig.ident %in% 'KUM_D25']))
+LAW <- subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[rnaAggr.all$orig.ident %in% 'LAW_D25']))
+VAN <-   subset(rnaAggr.all, cells = names(rnaAggr.all@active.ident[rnaAggr.all$orig.ident %in% 'VAN_D20']))
+DimPlot(rnaAggr.all, cells.highlight = colnames(adult), sizes.highlight = 0.5, cols = c('lightgrey', 'red'))
+DimPlot(rnaAggr.all, cells.highlight = colnames(Fetal), sizes.highlight = 0.5, cols = c('lightgrey', 'red'))
+DimPlot(rnaAggr.all, cells.highlight = colnames(Org), sizes.highlight = 0.5, cols = c('lightgrey', 'red'))
+DimPlot(Org, label = T, label.size = 3) + NoLegend()
+
+######make corr plot between samples
+##Jaccard index matrix
+
+#Function what using
+#' Summarise the crossver between two clusterings
+#'
+#' clusts data.frame with clustering information for each cell
+#' clust1 name of the first clustering column
+#' clust2 name of the second clustering column
+
+summariseClusts <- function(clusts, clust1, clust2) {
+  `!!` <- rlang::`!!`
+  `:=` <- rlang::`:=`
+  
+  clust1 <- rlang::enquo(clust1)
+  clust2 <- rlang::enquo(clust2)
+  
+  clusts %>%
+    mutate(!!rlang::quo_name(clust1) := factor(!!clust1),
+           !!rlang::quo_name(clust2) := factor(!!clust2)) %>%
+    filter(!is.na(!!clust1) & !is.na(!!clust2)) %>%
+    group_by(!!clust1, !!clust2) %>%
+    summarise(Count = n()) %>%
+    ungroup() %>%
+    complete(!!clust1, !!clust2) %>%
+    group_by(!!clust1) %>%
+    mutate(!!paste0(rlang::quo_name(clust1), "Total") :=
+             sum(Count, na.rm = TRUE),
+           !!paste0(rlang::quo_name(clust1), "Pct") :=
+             Count / sum(Count, na.rm = TRUE)) %>%
+    group_by(!!clust2) %>%
+    mutate(!!paste0(rlang::quo_name(clust2), "Total") :=
+             sum(Count, na.rm = TRUE),
+           !!paste0(rlang::quo_name(clust2), "Pct") :=
+             Count / sum(Count, na.rm = TRUE)) %>%
+    mutate(Jaccard = Count /
+             (!!rlang::sym(paste0(quo_name(clust1), "Total")) +
+                !!rlang::sym(paste0(quo_name(clust2), "Total")) -
+                Count))
+}
+
+#Making DataMatrix
+# datamatrix를 먼저 만들어서 요약합니다
+#들어가야 하는 항목, Barcode, Seurat_Cluster(active.ident), orig.ident(sample_name), SampleType
+#example: 전체 vs VAN_D20
+load(file = 'rnaAggr.all.ALL.SN.anno.with.SampleType.RData')
+
+all.clust <- rnaAggr.all.ALL.SN@meta.data %>% select('orig.ident')
+all.clust <- data.frame(all.clust, 'Barcode' = rownames(all.clust), 'all_cluster'=rnaAggr.all.ALL.SN@active.ident)
+write.csv(all.clust, file = 'ALL.SN.clsuter.assignment.csv')
+
+load(file = 'rnaAggr.all.org.only.anno.RData')
+VAN <- subset(rnaAggr.all.org, cells = names(rnaAggr.all.org@active.ident[rnaAggr.all.org$orig.ident %in% 'VAN_D20']))
+van.clust <- VAN@meta.data %>% select('orig.ident')
+van.clust <- data.frame(van.clust, 'Barcode' = rownames(van.clust), 'van_cluster' = VAN@active.ident)
+#Barcode 확인후 같은 barcode로 맞추어 줘야합니다
+
+barcode <- van.clust[, 'Barcode']
+barcode <- strsplit(as.character(barcode) , split = '-') 
+barcode <- as.data.frame(barcode)
+barcode <- t(barcode)
+barcode <- barcode[,1]
+barcode <- paste(barcode, '14', sep = '-')
+van.clust[,'Barcode'] <- barcode
+
+
+
+clusts <- all.clust %>% left_join(van.clust, by = c('orig.ident', 'Barcode'))
+all_cluster_name <- c('aFIB+oStroma+fIC', 'fIC+oStroma', 'fIC+oStroma2', 'aPEC+fREN+IC/IC/oStroma', 'fIC_Prog+oStroma', 'oStroma+CC', 'fIC+CC', 'fPTA', 'fPTA2', 'fPTA+CC', 'Podo', 'Podo+fPTA', 'aPT', 'PT+fUBCD', 'fUE/CNT/UBCD+oLH', 'aTAL+fDT', 'aDCT', 'Endo', 'aCNT+aPC', 'aPT(VCAM1)/PEC+Endo', 'aICA+B', 'Muscle_Prog')
+van_cluster_name <- c('Mesen1', 'Mes+CC1', 'Mesen2', 'Podo1', 'Mes-like1', 'Tubule(PT+LH)', 'Mes-like2', 'Podo2', 'Mes+CC2', 'Tubule(PT)', 'Endo1', 'Mesen4', 'Endo2', 'Tubule-like')
+Jaccard <- summariseClusts(clusts, all_cluster, Van_cluster) %>%
+  replace_na(list(Jaccard = 0)) %>%
+  ggplot(aes(x = all_cluster, y = Van_cluster, fill = Jaccard)) +
+  geom_tile() +
+  scale_fill_viridis_c(limits = c(0, 1), name = "Jaccard\nindex") +
+  scale_x_discrete(labels = all_cluster_name, ) +
+  scale_y_discrete(labels = van_cluster_name) +
+  coord_equal() +
+  xlab("Combined clusters") +
+  ylab("Organoid clusters") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 10, colour = "black",angle = 90),
+        axis.text.y = element_text(size = 10, colour = 'black'),
+        axis.ticks = element_blank(),
+        axis.title = element_text(size = 15),
+        legend.key.height = unit(30, "pt"),
+        legend.title = element_text(size = 15),
+        legend.text = element_text(size = 10),
+        panel.grid = element_blank())
+Jaccard
+
+##Pearson Correlation heatmap
+#draw heatmap using variable features between 2 samples
+#
+#example: organoid_Com_D25 VS Fetal_Wk13
+load(file = 'rnaAggr.all.org.only.anno.RData')
+org.cluster <- unique(rnaAggr.all.org@active.ident)
+gcmatrix2 <- matrix(nrow = length(rownames(rnaAggr.all.org[['RNA']])), ncol = length(org.cluster))
+rownames(gcmatrix2) <- rownames(rnaAggr.all.org[['RNA']])
+colnames(gcmatrix2) <- org.cluster
+table(rnaAggr.all.org$orig.ident)
+for (i in org.cluster) {
+  p = rnaAggr.all.org[['RNA']][,rnaAggr.all.org@active.ident == i & rnaAggr.all.org@meta.data$orig.ident == 'COM_Day25']
+  gcmatrix2[,i] = rowSums(as.matrix(p))
+  print(i)
+}
+table(gcmatrix2)
+
+load(file = 'rnaAggr.all.fet.only.anno.RData')
+fetal.cluster <- unique(rnaAggr.all.fet@active.ident)
+gcmatrix <- matrix(nrow = length(rownames(rnaAggr.all.fet[['RNA']])), ncol = length(fetal.cluster))
+rownames(gcmatrix) <- rownames(rnaAggr.all.fet[['RNA']])
+colnames(gcmatrix) <- fetal.cluster
+table(rnaAggr.all.fet$orig.ident)
+for (i in fetal.cluster) {
+  p = rnaAggr.all.fet[['RNA']][,rnaAggr.all.fet@active.ident == i & rnaAggr.all.fet@meta.data$orig.ident == 'HUM_WK13']
+  gcmatrix[,i] = rowSums(as.matrix(p))
+  print(i)
+}
+table(gcmatrix)
+
+#VariableFeatures하려면 findvariablefeature 먼저 오브젝트에 해놔야함
+aa <- FindVariableFeatures(rnaAggr.all.fet)
+var.gene <- VariableFeatures(aa)
+var.gene2 <- intersect(var.gene, rownames(gcmatrix2))
+
+fetal.ct <- c('NPC', 'IC1', 'IC2', 'Endo', 'PTA+CC2', 'Podo+PTA', 'Immune', 'IC1+CC', 'Dis/Med_Segment', 'PTA+CC', 'Podo2', 'PTA+Pr+PD', 'Mesangial', 'UE+CNT', 'Podo1', 'PTA+Proximal_Segment')
+org.ct <- c('Mesen3', 'Mesen5', 'Mesen2', 'Mes+CC1', 'Tubule-like', 'Mes-like1', 'Mesen1', 'Endo1', 'Mes-like2', 'Mes+CC2', 'Tubule(PT+LH)', 'Mesen4', 'Endo2', 'Podo1', 'Podo2', 'Muscle-like', 'Tubule(PT)')
+
+gcmatrix_fetal <- gcmatrix
+gcmatrix_org <- gcmatrix2
+
+gcmatrix_fetal <- gcmatrix_fetal[,fetal.ct]
+gcmatrix_fetal <- as.matrix(gcmatrix_fetal)
+gcmatrix_fetal = apply(gcmatrix_fetal, 2, function(x) (x/sum(x))*10000)
+
+gcmatrix_fetal <- gcmatrix_fetal[var.gene2,]
+
+gcmatrix_org <- gcmatrix_org[,org.ct]
+gcmatrix_org <- as.matrix(gcmatrix_org)
+gcmatrix_org = apply(gcmatrix_org, 2, function(x) (x/sum(x))*10000)
+
+gcmatrix_org <- gcmatrix_org[var.gene2,]
+
+
+for(i in rownames(gcmatrix_fetal)){
+  gcmatrix_fetal[i,] = (gcmatrix_fetal[i,] - mean(gcmatrix_fetal[i,]) )/sd(gcmatrix_fetal[i,])
+}
+
+for(i in rownames(gcmatrix_org)){
+  gcmatrix_org[i,] = ( gcmatrix_org[i,] - mean(gcmatrix_org[i,]) ) / sd(gcmatrix_org[i,]) 
+}
+
+i = "NPC"
+t1 = names(gcmatrix_fetal[is.na(gcmatrix_fetal[,i]),i])
+
+i = "Mesen3"
+t2 = names(gcmatrix_org[is.na(gcmatrix_org[,i]),i]) 
+
+var.gene3 = setdiff(var.gene2,t2)
+var.gene3 = setdiff(var.gene3,t1)
+
+
+corr_mat2 = matrix(nrow = length(fetal.ct), ncol = length(org.ct))
+rownames(corr_mat2) = fetal.ct
+colnames(corr_mat2) = org.ct
+
+
+for(i in fetal.ct){
+  for(j in org.ct){
+    corr_mat2[i,j] = cor(gcmatrix_fetal[var.gene3,i], gcmatrix_org[var.gene3,j], method = "pearson")
+  }
+  print(i)
+}
+x = corr_mat2
+my_palette <-colorRampPalette(c("blue","white","red"))(50)
+par("mar")
+par(mar=c(1,1,1,1))
+library(gplots)
+pdf("FetalvsOrg.Com.WK13dd.pdf")
+heatmap.2(x[1:dim(x)[1],], col = my_palette, keysize = 1, density.info="none", trace="none",cexRow=1.5,cexCol = 1.5,
+          breaks=c(seq(-0.7,0.7, length=51) ),Rowv=F, Colv=F, dendrogram="none", margins = c(10,10),
+          colsep=0:(ncol(x)+1),rowsep=0:(nrow(x)+1),sepcolor="black", sepwidth=c(0.01,0.01))
+dev.off()
+
+##make function of corrmatrix 
+#corrheatmap를 편하게 쓰기 위하여 함수로 제작하였습니다.
+load(file = 'rnaAggr.all.ALL.SN.anno.with.SampleType.RData')
+rnaAggr.all.ALL.SN <- FindVariableFeatures(rnaAggr.all.ALL.SN, selection.method = 'vst', nfeatures = 1000, verbose = F)
+all_cluster_name <- c('aFIB+oStroma+fIC', 'fIC+oStroma', 'fIC+oStroma2', 'aPEC+fREN+IC/IC/oStroma', 'fIC_Prog+oStroma', 'oStroma+CC', 'fIC+CC', 'fPTA', 'fPTA2', 'fPTA+CC', 'Podo', 'Podo+fPTA', 'aPT', 'PT+fUBCD', 'fUE/CNT/UBCD+oLH', 'aTAL+fDT', 'aDCT', 'Endo', 'aCNT+aPC', 'aPT(VCAM1)/PEC+Endo', 'aICA+B', 'Muscle_Prog')
+orig.ident <- c( "AY_AS_D29", "COM_D25", "HOW_DAY25", 'HUM_SN1', 'HUM_SN2', 'HUM_SN3', "HUM_WK13", "HUM_WK17", "HUM_WK18", 'HUM_WK9', "JH_DAY10", "KUM_D25", "LAW_D25", "VAN_D20")
+my_palette <-colorRampPalette(c("blue","white","red"))(50)
+##sample subset
+adult <- subset(rnaAggr.all.ALL.SN, cells = names(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN$orig.ident %in% c('HUM_SN1', 'HUM_SN2', 'HUM_SN3')]))
+Fetal <- subset(rnaAggr.all.ALL.SN, cells = names(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN$orig.ident %in% c('HUM_WK17', 'HUM_WK13', 'HUM_WK9', 'HUM_WK18')]))
+Org <- subset(rnaAggr.all.ALL.SN, cells = names(rnaAggr.all.ALL.SN@active.ident[!rnaAggr.all.ALL.SN$orig.ident %in% c('HUM_WK17', 'HUM_WK13', 'HUM_WK9', 'HUM_WK18', 'HUM_SN1', 'HUM_SN2', 'HUM_SN3')]))
+org.orig.ident <- c("AY_AS_D29", "COM_D25", "HOW_DAY25", "JH_DAY10", "KUM_D25", "LAW_D25", "VAN_D20")
+#object1 = organoid, object2 = adult, a=org.orig.ident수
+Corrheatm <- function(object1, object2, a){
+  object1.cluster <- unique(object1@active.ident)
+  gcmatrix2 <- matrix(nrow = length(rownames(object1[['RNA']])), ncol = length(object1.cluster))
+  rownames(gcmatrix2) <- rownames(object1[['RNA']])
+  colnames(gcmatrix2) <- object1.cluster
+  for (i in object1.cluster) {
+    p = object1[['RNA']][,object1@active.ident == i & object1@meta.data$orig.ident == org.orig.ident[a]]
+    gcmatrix2[,i] = rowSums(as.matrix(p))
+    print(i)
+  }
+  
+  object2.cluster <- unique(object2@active.ident)
+  gcmatrix <- matrix(nrow = length(rownames(object2[['RNA']])), ncol = length(object2.cluster))
+  rownames(gcmatrix) <- rownames(object2[['RNA']])
+  colnames(gcmatrix) <- object2.cluster
+  for (i in object2.cluster) {
+    p = object2[['RNA']][,object2@active.ident == i]
+    gcmatrix[,i] = rowSums(as.matrix(p))
+    print(i)
+  }
+  var.gene <- VariableFeatures(object2)
+  var.gene2 <- intersect(var.gene, rownames(gcmatrix2))
+  
+  adult.ct <- levels(object2@active.ident)
+  org.ct <- levels(object1@active.ident[object1$orig.ident == org.orig.ident[a]])
+  
+  gcmatrix_adult <- gcmatrix
+  gcmatrix_org <- gcmatrix2
+  
+  gcmatrix_adult <- gcmatrix_adult[,adult.ct]
+  gcmatrix_adult <- as.matrix(gcmatrix_adult)
+  gcmatrix_adult = apply(gcmatrix_adult, 2, function(x) (x/sum(x))*10000)
+  
+  gcmatrix_adult <- gcmatrix_adult[var.gene2,]
+  
+  gcmatrix_org <- gcmatrix_org[,org.ct]
+  gcmatrix_org <- as.matrix(gcmatrix_org)
+  gcmatrix_org = apply(gcmatrix_org, 2, function(x) (x/sum(x))*10000)
+  
+  gcmatrix_org <- gcmatrix_org[var.gene2,]
+  gcmatrix_org[is.na(gcmatrix_org)] <- 0
+  
+  for(i in rownames(gcmatrix_adult)){
+    gcmatrix_adult[i,] = (gcmatrix_adult[i,] - mean(gcmatrix_adult[i,]) )/sd(gcmatrix_adult[i,])
+  }
+  
+  for(i in rownames(gcmatrix_org)){
+    gcmatrix_org[i,] = ( gcmatrix_org[i,] - mean(gcmatrix_org[i,]) ) / sd(gcmatrix_org[i,]) 
+  }
+  
+  i = adult.ct[1]
+  t1 = names(gcmatrix_adult[is.na(gcmatrix_adult[,i]),i])
+  
+  i = org.ct[1]
+  t2 = names(gcmatrix_org[is.na(gcmatrix_org[,i]),i]) 
+  
+  var.gene3 = setdiff(var.gene2,t2)
+  var.gene3 = setdiff(var.gene3,t1)
+  
+  
+  corr_mat2 = matrix(nrow = length(adult.ct), ncol = length(org.ct))
+  rownames(corr_mat2) = adult.ct
+  colnames(corr_mat2) = org.ct
+  
+  
+  for(i in adult.ct){
+    for(j in org.ct){
+      corr_mat2[i,j] = cor(gcmatrix_adult[var.gene3,i], gcmatrix_org[var.gene3,j], method = "pearson")
+    }
+    print(i)
+  }
+  x = corr_mat2
+  return(x) 
+  
+}
+
+a <- Corrheatm(Org, adult, 7)
+my_palette <-colorRampPalette(c("blue","white","red"))(50)
+par("mar")
+par(mar=c(1,1,1,1))
+
+pdf("aab.pdf")
+heatmap.2(x[1:dim(x)[1],], col = my_palette, keysize = 1, density.info="none", trace="none",cexRow=1,cexCol = 1,
+          breaks=c(seq(-0.7,0.7, length=51) ),Rowv=F, Colv=F, dendrogram="none", margins = c(15,15),
+          colsep=0:(ncol(x)+1),rowsep=0:(nrow(x)+1),sepcolor="black", sepwidth=c(0.01,0.01))
+dev.off()
+
+#clustree (NOT Used)
+library(clustree)
+clustree(rnaAggr.all) # resolution 여러개 만들어놓고 어떤 res고를지 고민할때 사용 
+clustree(rnaAggr.all, node_colour = "sc3_stability") #SC3 stability?
+clustree(rnaAggr.all, node_colour = 'PECAM1',
+         node_colour_aggr = 'mean',
+         exprs = 'scale.data') +
+  scale_colour_viridis_c(option = 'plasma', begin = 0.3) #특정 유전자
+table(rnaAggr.all.ALL.SN$seurat_clusters)
+
+#plot for check relationship between cells and cell-types 
+org <- sum(rnaAggr.all.ALL.SN@meta.data$SampleType == "Org")
+fetal <- sum(rnaAggr.all.ALL.SN@meta.data$SampleType == "Fetal")
+Adult <- sum(rnaAggr.all.ALL.SN@meta.data$SampleType == "Adult")
+rnaAggr.all.ALL.SN[['Celltype']] <- Idents(rnaAggr.all.ALL.SN)
+
+plot.data <- rnaAggr.all.ALL.SN@meta.data %>%
+  select(SampleType, cluster = Celltype) %>%
+  mutate(cluster = factor(as.numeric(cluster))) %>%
+  group_by(cluster, SampleType) %>%
+  summarise(count = n()) %>%
+  mutate(clust_total = sum(count)) %>%
+  mutate(clust_prop = count / clust_total) %>%
+  mutate(SampleType_total = ifelse(SampleType == 'Org', org, ifelse(SampleType == 'Fetal', fetal, Adult))) %>%
+  mutate(SampleType_prop = count / SampleType_total)
+
+table(rnaAggr.all.ALL.SN@meta.data$Celltype)
+table(rnaAggr.all.ALL.SN@active.ident)
+ggplot(plot.data, aes(x = cluster, y = count, fill = SampleType)) + geom_col() + theme_classic() #Cell count each seurat_cluster(실제 클러스터랑 순서 좀 다름)
+ggplot(plot.data, aes(x = cluster, y = clust_prop, fill = SampleType)) + geom_col() + theme_classic() #Cell Proportion each cluster
+ggplot(plot.data, aes(x = cluster, y = SampleType_prop, fill = SampleType)) + 
+  geom_col(position = position_dodge(0.9)) + theme_classic() #sampletype별 cell prop in each cluster
+
+
+#marker finding example (not used)
+BiocManager::install("BiocParallel")
+library(BiocParallel)
+n.clusts <- length(unique(Idents(rnaAggr.all)))
+
+markers <- bplapply(seq_len(n.clusts) -1, function(cl) {
+  cl.markers <- FindMarkers(rnaAggr.all, cl, logfc.threshold = 0, min.pct = 0.1,
+                            print.bar = FALSE)
+  cl.markers$cluster <- cl
+  cl.markers$gene <- rownames(cl.markers)
+  return(cl.markers)
+}, BPPARAM = bpparam())
+
+markers <- bind_rows(markers) %>%
+  select(gene, cluster, everything())
+
+### FindConservedMarker
+#check the conserved markers among samples, sample-types, and cell-types
+#test
+Ad.Org <- subset(rnaAggr.all.ALL.SN, cells = names(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN$SampleType %in% c('Adult', 'Org')]))
+table(Ft.Org$Celltype)
+Ft.Org <- subset(rnaAggr.all.ALL.SN, cells = names(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN@meta.data$SampleType %in% c('Fetal', 'Org')]))
+
+ad.fetal.marker <- FindConservedMarkers(rnaAggr.all.ALL.SN, ident.1 = 'Podo', grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+
+skip <- Ad.Org@meta.data %>%
+  count(SampleType, Cluster = !! rlang::sym("Celltype")) %>%
+  spread(SampleType, n) %>%
+  replace_na(list(Adult = 0L, Org = 0L)) %>%
+  rowwise() %>%
+  mutate(Skip = min(Adult, Org) < 3) %>%
+  arrange(as.numeric(Cluster)) %>%
+  pull(Skip)
+n.clusts <- length(unique(Ad.Org$Celltype))
+con.markers <- bplapply(seq_len(n.clusts) - 1, function(cl) {
+  
+  if (skip[cl + 1]) {
+    message("Skipping cluster ", cl)
+    cl.markers <- c()
+  } else {
+    cl.markers <- FindConservedMarkers(Ad.Org, cl, grouping.var = "SampleType",
+                                       logfc.threshold = 0, min.pct = 0.1)
+    cl.markers$cluster <- cl
+    cl.markers$gene <- rownames(cl.markers)
+  }
+  
+  return(cl.markers)
+}, BPPARAM = bpparam()) ##잘안됨 = 왜?
+
+
+celltype <- levels(Ad.Org$Celltype)
+con.markers <- FindConservedMarkers(Ad.Org, ident.1 = celltype[1] , grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+conserved <- list()
+conserved[1] <- con.markers
+a=2
+con.markers <- data.frame() #dataframe안됨 list로 해야함
+for (a in a:n.clusts) {
+  if(skip[a] == TRUE){ message('skip')
+  }
+  else{
+  con.markers <- FindConservedMarkers(Ad.Org, ident.1 = celltype[a] , grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+  conserved[a] <- con.markers
+  }
+}
+names(conserved) <- all_cluster_name[1:20]
+aa <- conserved[1]
+aa <- as.data.frame(aa)
+conserved.markergene.finding <- rnaAggr.all.ALL.SN
+Storma.iC <- subset(rnaAggr.all.ALL.SN, cells = names(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN@active.ident %in% c('aFIB+oStroma+fIC', 'fIC+oStroma', 'fIC+oStroma2', 'aPEC+fREN+IC/IC/oStroma', 'fIC_Prog+oStroma', 'oStroma+CC', 'fIC+CC')]))
+Nephron <- subset(rnaAggr.all.ALL.SN, cells = names(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN@active.ident %in% c('fPTA', 'fPTA2', 'fPTA+CC', 'Podo', 'Podo+fPTA', 'aPT', 'PT+fUBCD', 'fUE/CNT/UBCD+oLH', 'aTAL+fDT', 'aDCT', 'aCNT+aPC')]))
+Endo <-  subset(rnaAggr.all.ALL.SN, cells = names(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN@active.ident %in% c('Endo','aPT(VCAM1)/PEC+Endo')]))
+Diff.Neph <- subset(rnaAggr.all.ALL.SN, cells = names(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN@active.ident %in% c('Podo', 'aPT', 'PT+fUBCD', 'fUE/CNT/UBCD+oLH', 'aTAL+fDT', 'aDCT', 'aCNT+aPC')]))
+stroma.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Stroma/IC',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+nephron.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Nephron',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+Idents(Storma.iC) <- 'Stroma/IC'
+Idents(Nephron) <- 'Nephron'
+Idents(Endo) <- 'Endo'
+c <- Idents(Endo)
+c <- as.data.frame(c)
+Idents(conserved.markergene.finding) <- a
+table(conserved.markergene.finding@active.ident)
+conserved.markergene.finding <- RenameIdents(conserved.markergene.finding, 'aFIB+oStroma+fIC'='Stroma/IC', 'fIC+oStroma'='Stroma/IC', 'fIC+oStroma2'='Stroma/IC', 'aPEC+fREN+IC/IC/oStroma'='Stroma/IC', 'fIC_Prog+oStroma'='Stroma/IC', 'oStroma+CC'='Stroma/IC', 'fIC+CC'='Stroma/IC')
+conserved.markergene.finding <- RenameIdents(conserved.markergene.finding, 'fPTA'='Nephron', 'fPTA2'='Nephron', 'fPTA+CC'='Nephron', 'Podo'='Nephron', 'Podo+fPTA'='Nephron', 'aPT'='Nephron', 'PT+fUBCD'='Nephron', 'fUE/CNT/UBCD+oLH'='Nephron', 'aTAL+fDT'='Nephron', 'aDCT'='Nephron', 'aCNT+aPC'='Nephron')
+conserved.markergene.finding <- RenameIdents(conserved.markergene.finding, 'Podo'='Podocyte', 'Podo+fPTA'='Podocyte', 'PT+fUBCD'='fPT', 'fUE/CNT/UBCD+oLH'='fPT','aTAL+fDT'='TAL', 'aDCT'='DCT', 'aCNT+aPC'='CNT', 'Endo'='Endo', 'aPT(VCAM1)/PEC+Endo'='Endo2')
+Podocyte.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Podocyte',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+fPT.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'fPT',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+aPT.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'aPT',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+endo.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Endo',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+endo2.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Endo2',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+write.csv(stroma.marker, file = 'Conserved_marker.Stroma.rnaAggr.all.ALL.SN.csv')
+write.csv(nephron.marker, file = 'Conserved_marker.Nephron.rnaAggr.all.ALL.SN.csv')
+write.csv(Podocyte.marker, file = 'Conserved_marker.Podocyte.rnaAggr.all.ALL.SN.csv')
+write.csv(fPT.marker, file = 'Conserved_marker.fPT.rnaAggr.all.ALL.SN.csv')
+write.csv(aPT.marker, file = 'Conserved_marker.aPT.rnaAggr.all.ALL.SN.csv')
+write.csv(endo.marker, file = 'Conserved_marker.Endo.rnaAggr.all.ALL.SN.csv')
+write.csv(endo2.marker, file = 'Conserved_marker.Endo2.rnaAggr.all.ALL.SN.csv')
+
+#by orig.ident
+conserved.markergene.finding <- rnaAggr.all.ALL.SN
+conserved.markergene.finding <- RenameIdents(conserved.markergene.finding, 'Podo'='Podocyte', 'Podo+fPTA'='Podocyte', 'PT+fUBCD'='fPT', 'fUE/CNT/UBCD+oLH'='fPT','aTAL+fDT'='TAL', 'aDCT'='DCT', 'aCNT+aPC'='CNT', 'Endo'='Endo', 'aPT(VCAM1)/PEC+Endo'='Endo2')
+cmf <- conserved.markergene.finding
+
+#vand20,ay,com,how~
+cmf <- subset(cmf, cells = names(cmf@active.ident[cmf$orig.ident %in% c('HUM_SN1', 'HUM_SN2', 'HUM_SN3', "HUM_WK13", "HUM_WK17", "HUM_WK18", 'HUM_WK9', 'KUM_D25')]))
+Podocyte.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Podocyte',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+fPT.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'fPT',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+aPT.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'aPT',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+endo.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Endo',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+endo2.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Endo2',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+write.csv(Podocyte.marker, file = 'Conserved_marker.KUM_D25.Podocyte.rnaAggr.all.ALL.SN.csv')
+write.csv(fPT.marker, file = 'Conserved_marker.KUM_D25.fPT.rnaAggr.all.ALL.SN.csv')
+write.csv(aPT.marker, file = 'Conserved_marker.KUM_D25.aPT.rnaAggr.all.ALL.SN.csv')
+write.csv(endo.marker, file = 'Conserved_marker.KUM_D25.Endo.rnaAggr.all.ALL.SN.csv')
+write.csv(endo2.marker, file = 'Conserved_marker.KUM_D25.Endo2.rnaAggr.all.ALL.SN.csv')
+
+cmf <- conserved.markergene.finding
+cmf <- subset(cmf, cells = names(cmf@active.ident[cmf$orig.ident %in% c("HUM_WK13", "HUM_WK17", "HUM_WK18", 'HUM_WK9')]))
+cmf <- subset(cmf, cells = names(cmf@active.ident[cmf$orig.ident %in% c('HUM_SN1', 'HUM_SN2', 'HUM_SN3', "HUM_WK13", "HUM_WK17", "HUM_WK18", 'HUM_WK9')]))
+
+Podocyte.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Podocyte',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+fPT.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'fPT',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+aPT.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'aPT',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+endo.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Endo',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+endo2.marker <- FindConservedMarkers(conserved.markergene.finding, ident.1 = 'Endo2',  grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+write.csv(Podocyte.marker, file = 'Conserved_marker.LAW_D25.Podocyte.rnaAggr.all.ALL.SN.csv')
+write.csv(fPT.marker, file = 'Conserved_marker.LAW_D25.fPT.rnaAggr.all.ALL.SN.csv')
+write.csv(aPT.marker, file = 'Conserved_marker.LAW_D25.aPT.rnaAggr.all.ALL.SN.csv')
+write.csv(endo.marker, file = 'Conserved_marker.LAW_D25.Endo.rnaAggr.all.ALL.SN.csv')
+write.csv(endo2.marker, file = 'Conserved_marker.LAW_D25.Endo2.rnaAggr.all.ALL.SN.csv')
+
+conserved.markergene.finding <- rnaAggr.all.ALL.SN
+conserved.markergene.finding <- RenameIdents(conserved.markergene.finding, 'Podo'='Podocyte', 'Podo+fPTA'='Podocyte', 'PT+fUBCD'='fPT', 'fUE/CNT/UBCD+oLH'='fPT','aTAL+fDT'='TAL', 'aDCT'='DCT', 'aCNT+aPC'='CNT', 'Endo'='Endo', 'aPT(VCAM1)/PEC+Endo'='Endo2')
+cmf <- conserved.markergene.finding
+
+#vand20,ay,com,how~
+cmf <- subset(cmf, cells = names(cmf@active.ident[cmf$orig.ident %in% c('KUM_D25')]))
+kum <- FindMarkers(cmf, ident.1 = 'Podocyte')
+cmf <- conserved.markergene.finding
+cmf <- subset(cmf, cells = names(cmf@active.ident[cmf$orig.ident %in% c('VAN_D20')]))
+van <- FindMarkers(cmf, ident.1 = 'Podocyte')
+cmf <- conserved.markergene.finding
+cmf <- subset(cmf, cells = names(cmf@active.ident[cmf$orig.ident %in% c('COM_D25')]))
+com <- FindMarkers(cmf, ident.1 = c('Podocyte', 'aPT'))
+
+#seperate fetal/
+Podocyte.marker <- FindConservedMarkers(cmf, ident.1 = 'Podocyte',  grouping.var = 'orig.ident', logfc.threshold = 0, min.pct = 0.1)
+fPT.marker <- FindConservedMarkers(cmf, ident.1 = 'fPT',  grouping.var = 'orig.ident', logfc.threshold = 0, min.pct = 0.1)
+aPT.marker <- FindConservedMarkers(cmf, ident.1 = 'aPT',  grouping.var = 'orig.ident', logfc.threshold = 0, min.pct = 0.1)
+
+
+write.csv(aPT.marker, file = 'Conserved_marker.Fetal.aPT.rnaAggr.all.ALL.SN.csv')
+
+###Reannotation to more concise name using other references
+#In the case of previous names, we wrote down all the names of expressed marker, but this time it's concisely marked.
+load(file = 'rnaAggr.all.ALL.SN.anno.with.SampleType.RData')
+all_cluster_name <- c('aFIB+oStroma+fIC', 'fIC+oStroma', 'fIC+oStroma2', 'aPEC+fREN+IC/IC/oStroma', 'fIC_Prog+oStroma', 'oStroma+CC', 'fIC+CC', 'fPTA', 'fPTA2', 'fPTA+CC', 'Podo', 'Podo+fPTA', 'aPT', 'PT+fUBCD', 'fUE/CNT/UBCD+oLH', 'aTAL+fDT', 'aDCT', 'Endo', 'aCNT+aPC', 'aPT(VCAM1)/PEC+Endo', 'aICA+B', 'Muscle_Prog')
+table(rnaAggr.all.re@active.ident)
+rnaAggr.all.re <- rnaAggr.all.ALL.SN
+rnaAggr.all.re <- RenameIdents(rnaAggr.all.re, 'aFIB+oStroma+fIC'='Stroma/IC1', 'fIC+oStroma'='Stroma/IC2', 'fIC+oStroma2'='Stroma/IC3', 'aPEC+fREN+IC/IC/oStroma'='Stroma/IC4', 'fIC_Prog+oStroma'='Stroma/IC5', 'oStroma+CC'='Stroma/IC+CC1', 'fIC+CC'='Stroma/IC+CC2', 'fPTA'='PTA', 'fPTA2'='PTA2', 'fPTA+CC'='PTA+CC', 'Podo'='Podo', 'Podo+fPTA'='Podo+PTA', 'aPT'='aPT', 'PT+fUBCD'='fPT1', 'fUE/CNT/UBCD+oLH'='fPT2', 'aTAL+fDT'='TAL', 'aDCT'='DCT', 'Endo'='Endo1', 'aCNT+aPC'='CNT', 'aPT(VCAM1)/PEC+Endo'='Endo2', 'aICA+B'='ICA+B', 'Muscle_Prog'='MP')
+rnaAggr.all.re$Celltype <- Idents(rnaAggr.all.re)
+DimPlot(rnaAggr.all.re, label = T, label.size = 4)
+#heatmap of markers
+all.marker <- read.csv(file = 'rnaAggr.all.ALL.SN.Marker.csv', header = T, row.names = 'X')
+cols <- viridis::viridis(100)[c(1, 50, 100)]
+top <- all.marker %>% group_by(cluster) %>% top_n(2, avg_logFC)
+rnaAggr.scale <- rnaAggr.all.re
+rnaAggr.scale@assays$RNA@scale.data <- rnaAggr@assays$RNA@scale.data
+remove(rnaAggr)
+pdf("marker.heatmap.test.pdf")
+DoHeatmap(rnaAggr.scale, features = as.character(top$gene), label = F)
+dev.off()
+
+##featureplot without grid
+p <- FeaturePlot(rnaAggr.all.re, features = c("CPB1", "CXCL14", "DLK1", "DCN", "SIX1", "PAX2", "MAFB", "TUBB2B"), combine = F)
+
+for(i in 1:length(p)) {
+  p[[i]] <- p[[i]] + NoLegend() + NoAxes()
+}
+
+cowplot::plot_grid(plotlist = p)
+
+##within cluster DE
+
+de <- rnaAggr.all.re
+de@meta.data$SampleCluster <- paste(de@meta.data$SampleType, de@active.ident, sep = '_')
+de[['cluster']] <- Idents(object = de)
+Idents(de) <- de$SampleCluster
+table(de$SampleCluster)
+tibble::rownames_to_column()
+de.a <- subset(de, cells = names(de@active.ident[de$SampleType %in% c('Adult', 'Org')]))
+de.b <- subset(de, cells = names(de@active.ident[de$SampleType %in% c('Adult', 'Org')]))
+
+#Fetal Vs Org
+plot.data <- AverageExpression(de.a, show.progress = T)
+plot.data <- plot.data$RNA %>%
+  tibble::rownames_to_column("Gene") %>%
+  tidyr::gather(key = "SampleCluster", value = "AvgExp", -Gene) %>%
+  tidyr::separate(SampleCluster, c("SampleType", "Cluster"), sep = "_") %>%
+  mutate(Cluster = factor(as.character(Cluster))) %>%
+  mutate(LogAvgExp = log1p(AvgExp)) %>%
+  select(-AvgExp) %>%
+  tidyr::spread(SampleType, LogAvgExp) %>%
+  tidyr::replace_na(list(Fetal = 0, Org = 0)) %>%
+  mutate(Avg = 0.5 * (Fetal + Org),
+         Diff = Fetal - Org)
+
+ggplot(plot.data, aes(x = Avg, y = Diff)) +
+  geom_hline(yintercept = 0, colour = "red") +
+  geom_point(size = 0.6, alpha = 0.2) +
+  xlab("0.5 * (Fetal + Org)") +
+  ylab("Fetal - Org") +
+  facet_wrap(~ Cluster) + 
+  theme_classic()
+#Adult Vs Org
+plot.data <- AverageExpression(de.b, show.progress = T)
+plot.data <- plot.data$RNA %>%
+  tibble::rownames_to_column("Gene") %>%
+  tidyr::gather(key = "SampleCluster", value = "AvgExp", -Gene) %>%
+  tidyr::separate(SampleCluster, c("SampleType", "Cluster"), sep = "_") %>%
+  mutate(Cluster = factor(as.character(Cluster))) %>%
+  mutate(LogAvgExp = log1p(AvgExp)) %>%
+  select(-AvgExp) %>%
+  tidyr::spread(SampleType, LogAvgExp) %>%
+  tidyr::replace_na(list(Adult = 0, Org = 0)) %>%
+  mutate(Avg = 0.5 * (Adult + Org),
+         Diff = Adult - Org)
+
+ggplot(plot.data, aes(x = Avg, y = Diff)) +
+  geom_hline(yintercept = 0, colour = "red") +
+  geom_point(size = 0.6, alpha = 0.2) +
+  xlab("0.5 * (Adult + Org)") +
+  ylab("Adult - Org") +
+  facet_wrap(~ Cluster) + 
+  theme_classic()
+
+
+###scanpy
+install.packages('reticulate')
+library('reticulate')
+library("ggplot2")
+library('SingleCellExperiment')
+library("scater")
+library("Seurat")
+
+exprs <- GetAssayData(rnaAggr.all.ALL.SN)
+meta <- rnaAggr.all.ALL.SN[[]]
+feature_meta <- GetAssay(rnaAggr.all.ALL.SN)[[]]
+embedding <- Embeddings(rnaAggr.all.ALL.SN, "umap")
+
+####making cellcount/cellpercent table
+Celltype <- levels(rnaAggr.all.ALL.SN@active.ident)
+orig.ident <- c( "AY_AS_D29", "COM_D25", "HOW_DAY25", 'HUM_SN1', 'HUM_SN2', 'HUM_SN3', "HUM_WK13", "HUM_WK17", "HUM_WK18", 'HUM_WK9', "JH_DAY10", "KUM_D25", "LAW_D25", "VAN_D20")
+
+a <- table(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN$orig.ident == 'AY_AS_D29'])
+a <- as.data.frame(a)
+a <- a[,2]
+a <- as.data.frame(a)
+a <- t(a)
+colnames(a) <- Celltype
+
+i=2
+for (i in 2:14) {
+  b <- table(rnaAggr.all.ALL.SN@active.ident[rnaAggr.all.ALL.SN$orig.ident == orig.ident[i]])
+  b <- data.frame(b)
+  b <- b[,2]
+  b <- as.data.frame(b)
+  b <- t(b)
+  colnames(b) <- Celltype
+  a <- rbind(a,b)
+  
+  
+}
+rownames(a) <- orig.ident
+Cellcount <- a
+b <- table(rnaAggr.all.ALL.SN$orig.ident)
+b <- as.data.frame(b) 
+b <- b$Freq
+i=1
+for(i in 1:14){
+  a[i,] = (a[i,]/b[i])*100
+}
+CellPercent <- a
+
+write.csv(Cellcount, file = 'CellCount.rnaAggr.all.ALL.SN.csv')
+write.csv(CellPercent, file = 'CellPercent.rnaAggr.all.ALL.SN.csv')
+
+table(rnaAggr.all.ALL.SN$orig.ident)
+####counting DEG numbers
+
+for(j in 0:40){  # 23 <- number of clusters-1
+  
+  n=table(rnaAggr.all@active.ident)
+  
+  ident=j
+  
+  n[names(n) %in% c(0:ident)]=0
+  
+  n=n[-1]
+  
+  o=n[n>0]
+  
+  ident2=names(o[1])
+  
+  bim <- FindMarkers(rnaAggr.all, ident.1 = ident,  ident.2 =ident2, only.pos = F, test.use = "bimod")
+  
+  deg=bim[bim$p_val_adj < 0.01,]
+  
+  deg1=deg[abs(deg$avg_logFC) >= 1,]
+  
+  degs=dim(deg)
+  
+  degs1=dim(deg1)
+  
+  
+  for(i in c(names(o[-1]))){
+    
+    bim <- FindMarkers(rnaAggr.all, ident.1 = ident,  ident.2 = i, only.pos = F, test.use = "bimod")
+    
+    deg=bim[bim$p_val_adj < 0.01,]
+    
+    deg1=deg[abs(deg$avg_logFC) >= 1,]
+    
+    degs=cbind(degs,dim(deg))
+    
+    degs1=cbind(degs1,dim(deg1))
+    
+  }
+  
+  print(degs1)
+  
+}
+table(rnaAggr.all.ALL.SN$seurat_clusters)
+
+##CC analysis
+
+cc.gene <- read.table("/home/qkrtltm100/kidney_organoid_3/CellcycleGene.txt", header = T)
+rnaAggr.all.cc <-CellCycleScoring(rnaAggr.all.re, s.features = cc.gene$G1.S, g2m.features = cc.gene$G2.M) 
+DimPlot(rnaAggr.all.cc, group.by = 'Phase')
+table(rnaAggr.all.cc$Phase)
+DimPlot(rnaAggr.all.re, group.by = 'seurat_clusters' ,label = T) +NoAxes()
+
+##stacked vln plot
+modify_vlnplot<- function(obj,
+                          
+                          feature,
+                          
+                          pt.size = 0,
+                          
+                          plot.margin = margin(0, 0, 0, 0, "cm"),
+                          
+                          ...) {
+  
+  p<- VlnPlot(obj, features = feature, pt.size = pt.size, ... )+
+    
+    ylab(feature) +
+    
+    theme(legend.position = "none",
+          
+          plot.title= element_blank(),
+          
+          axis.title.x = element_blank(),
+          
+          axis.text.x = element_blank(),
+          
+          axis.ticks.x = element_blank(),
+          
+          axis.title.y = element_text(size = rel(1), angle = 0),
+          
+          axis.text.y = element_text(size = rel(1)),
+          
+          plot.margin = plot.margin )
+  
+  return(p)
+  
+}
+
+## extract the max value of the y axis
+extract_max<- function(p){
+  
+  ymax<- max(ggplot_build(p)$layout$panel_scales_y[[1]]$range$range)
+  
+  return(ceiling(ymax))
+  
+}
+## main function
+StackedVlnPlot<- function(obj, features,
+                          
+                          pt.size = 0, 
+                          
+                          plot.margin = unit(c(-0.75, 0, -0.75, 0), "cm"),
+                          
+                          ...) {
+  plot_list<- purrr::map(features, function(x) modify_vlnplot(obj = obj,feature = x, ...))
+  # Add back x-axis title to bottom plot
+  
+  plot_list[[length(plot_list)]]<- plot_list[[length(plot_list)]] +
+    
+    theme(axis.text.x=element_text(), axis.ticks.x = element_line())
+  # change the y-axis tick to only max value 
+  
+  ymaxs<- purrr::map_dbl(plot_list, extract_max)
+  
+  plot_list<- purrr::map2(plot_list, ymaxs, function(x,y) x + scale_y_continuous(breaks = c(y)) + expand_limits(y = y))
+  
+  p<- patchwork::wrap_plots(plotlist = plot_list, ncol = 1)
+  return(p)
+}
+
+
+####monocle trajectory of nephron
+library(Seurat)
+library(monocle)
+load(file = 'rnaAggr.all.ALL.SN.anno.with.SampleType.RData')
+monocle <- RenameIdents(rnaAggr.all.ALL.SN, 'Podo'='Podo', 'Podo+fPTA'='Podo+fPTA', 'PT+fUBCD'='fPT', 'fUE/CNT/UBCD+oLH'='fPT2','aTAL+fDT'='TAL', 'aDCT'='DCT', 'aCNT+aPC'='CNT', 'Endo'='Endo', 'aPT(VCAM1)/PEC+Endo'='Endo2')
+sum(table(monocle@active.ident))
+monocle <- subset(monocle, cells = names(monocle@active.ident[monocle@active.ident %in% c('Podo', 'Podo+fPTA', 'fPT', 'fPT2', 'TAL', 'DCT', 'CNT', 'Endo', 'Endo2', 'fPTA', 'fPTA2', 'fPTA+CC', 'aPT')]))
+set.seed(100)
+monocle.r <-monocle
+#random classifying from total cell to 5000 cells
+a <- as.data.frame(table(monocle$orig.ident))
+for(i in rownames(a)){
+  a[i,2] = ((a[i,2] /29612)) *5000
+}
+a$Freq <- floor(a$Freq) # rounding down because index maximum is 5000
+sum(a$Freq) #4993
+b <- as.data.frame(table(monocle$orig.ident))
+a$total <- b$Freq
+d <- vector()
+summ <- 0
+for (i in 1:length(a$Var1)) {
+  rd <- sample(summ:a$total[i], a$Freq[i])
+  d <- c(d,rd)
+  summ <- summ+a$total[i]
+} # set random number evenly between samples
+
+
+monocle.r@assays$RNA@data <- monocle.r@assays$RNA@data[,d]
+table(monocle.r$orig.ident)
+table(kidney.monocle$SampleID)
+sum(table(name$SampleID))
+
+kidney.monocle <- monocle.r
+kidney.monocle[['SampleID']] <- kidney.monocle@meta.data$orig.ident
+kidney.monocle$nCount_RNA=NULL
+kidney.monocle$nFeature_RNA=NULL
+kidney.monocle$percent.mt=NULL
+kidney.monocle$orig.ident<-kidney.monocle@active.ident
+kidney.monocle@meta.data=kidney.monocle@meta.data[,c(1,5,6)]
+
+g <- as.data.frame(rownames(kidney.monocle@assays$RNA@counts))
+rownames(g) <- rownames(kidney.monocle@assays$RNA@counts)
+
+celltype <- levels(kidney.monocle@active.ident)
+con.marker1 <- FindConservedMarkers(monocle, ident.1 = celltype[1], grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+
+for (i in 2:length(celltype)) {
+  con.marker <- FindConservedMarkers(monocle, ident.1 = celltype[i], grouping.var = 'SampleType', logfc.threshold = 0, min.pct = 0.1)
+  con.marker1 <- rbind(con.marker1, con.marker) 
+}
+con.marker <- FindConservedMarkers(kidney.monocle, ident.1 = )
+
+
+#저거 conserved marker 구해서 conserved marker에서 avg_logFC높은 유전자들 구해서 한 6000개정도 유전자 뽑아서 그걸로 target만들기(count), g=사용된 유전자 이름 
+
+##임시로 allmarker에서 사용 
+np_cluster_name <- c('fPTA', 'fPTA2', 'fPTA+CC', 'Podo', 'Podo+fPTA', 'aPT', 'PT+fUBCD', 'fUE/CNT/UBCD+oLH', 'aTAL+fDT', 'aDCT', 'Endo', 'aCNT+aPC', 'aPT(VCAM1)/PEC+Endo')
+np.marker <- all.marker
+np.marker <- np.marker[base::which(np.marker$cluster == np_cluster_name),]
+table(all.marker$cluster)
+np.marker <- subset(all.marker, all.marker$cluster %in% np_cluster_name)
+np.gene <- np.marker$gene
+g <- as.data.frame(unique(np.gene))
+rownames(g) <- g$`unique(np.gene)`
+colnames(g) <- c("gene_short_name")
+
+table(name$SampleID)
+target <- kidney.monocle@assays$RNA@counts
+target=target[,colnames(target) %in% rownames(kidney.monocle@meta.data)]
+target<-as.matrix(target)
+target=as.matrix(t(target))
+name=merge(kidney.monocle@meta.data, target, by="row.names")
+rownames(name)=name$Row.names
+name=name[,-1]
+name[1:5,1:4]
+kidney.monocle@meta.data=name[,1:4]
+name=name[,-1:-3]
+name <- name[,colnames(name) %in% rownames(g)]
+target=t(name)
+target[1:5,1:4]
+g=as.data.frame(rownames(target))
+rownames(g)=rownames(target)
+colnames(g)=c("gene_short_name")
+
+
+
+pd <- new("AnnotatedDataFrame", data = kidney.monocle@meta.data)
+
+fd <- new("AnnotatedDataFrame", data = g)
+
+cds <- monocle::newCellDataSet(target, phenoData = pd, featureData = fd)
+
+HSMM <- monocle::newCellDataSet(as.matrix(aa), phenoData = pd, featureData = fd, expressionFamily=negbinomial.size())
+
+HSMM2 <- HSMM
+HSMM2 <- estimateSizeFactors(HSMM2)
+HSMM2 <- estimateDispersions(HSMM2)
+
+
+HSMM2 <- monocle::detectGenes(HSMM2, min_expr = 0.1)
+print(head(fData(HSMM3)))
+expressed_genes <- row.names(subset(fData(HSMM2), num_cells_expressed >= 10))
+print(head(pData(HSMM3)))
+
+diff_test_res <- monocle::differentialGeneTest(HSMM2[expressed_genes,], fullModelFormulaStr = "~orig.ident", verbose = T)
+ordering_genes <- row.names (subset(diff_test_res, qval < 0.01))
+HSMM2 <- monocle::setOrderingFilter(HSMM2, ordering_genes)
+monocle::plot_ordering_genes(HSMM2)
+HSMM2 <- monocle::reduceDimension(HSMM2, max_components = 2, method = 'DDRTree')
+HSMM2 <- monocle::orderCells(HSMM2)
+HSMM4 <- HSMM2
+root.state <- 3
+n.branch <- length(
+  HSMM4@auxOrderingData[[HSMM4@dim_reduce_type]]$branch_points
+)
+n.states <- length(unique(pData(HSMM4)$State))
+
+HSMM4 <- orderCells(HSMM4, root_state = root.state)
+
+monocle::plot_cell_trajectory(HSMM2, color_by = "State")
+plot_cell_trajectory(HSMM4, color_by = 'Pseudotime')
+
+pData(HSMM4) %>%
+  count(State, SampleID) %>%
+  tidyr::complete(State, SampleID, fill = list(n = 0)) %>%
+  group_by(State) %>%
+  mutate(Total = sum(n)) %>%
+  ggplot(aes(x = SampleID, y = n / Total, fill = State)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~ State, ncol = 1, labeller = label_both) +
+  labs(title = "State by SampleID",
+       x = "SampleID",
+       y = "Percentage of cells in state") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90))
+
+plot.genes <- c("CDH5", "MEIS1", "PDGFRA", "HMGB2", "CENPA", "SIX1",
+                "DAPL1", "NPHS1", "PODXL", "S100A8", "TYROBP", "MAL", "EMX2",
+                "LRP2", "GATA3", "SLC12A1", "SPINT2", "TUBB2B", "STMN2", "HBA1", "HBG1")
+pg <- c("PECAM1", "CDH5", "MEIS1", "PDGFRA", "HMGB2", "CENPA", "SIX1",
+        "DAPL1", "NPHS1", "PODXL", "S100A8", "TYROBP", "MAL")
+pg2 <- c("PECAM1", "CDH5", "MEIS1", "PDGFRA")
+
+is_present <- plot.genes %in% rownames(HSMM4)
+isp <- markergene %in% rownames(HSMM4)
+isp
+is_present
+is_exprs <- fData(HSMM4)[plot.genes[is_present], "ExprsCells"] > 10
+plot.genes.use <- plot.genes[is_present][is_exprs]
+
+plot_pseudotime_heatmap(HSMM4[plot.genes.use, ],
+                        num_clusters = 3,
+                        cores = 1,
+                        show_rownames = TRUE,
+                        hmcols = viridis::viridis(100))
+plot_genes_in_pseudotime(HSMM4[markergene,], ncol = 3, color_by = 'State')
+dev.off()
+
+table(rnaAggr.all.re$orig.ident)
+###figure 제작
+
+#figure 1A /700*700
+DimPlot(rnaAggr.all.re, label = T, label.size = 3.5) + NoLegend()
+
+#figure1B
+p1 <- DimPlot(rnaAggr.all.re, group.by = 'orig.ident')  +NoAxes() +ggtitle('SampleID') 
+p2 <- DimPlot(rnaAggr.all.re, group.by = 'SampleType', label = T, label.size = 5) + NoLegend() +NoAxes()
+p2+p1
+
+#figure1C
+markergene <- c('PCOLCE', 'SYNPO2', 'MFAP4', 'POSTN', 'LGALS1', 'LUM', 'OGN', "MIA", 'COL2A1', "EPYC",'CFH', 'TNC', 'REN', 'ACTA2',  'TOP2A', 'CENPF', 'LYPD1', 'DAPL1', 'EMX2', 'PAX8', 'PTPRO', 'NPHS2', 'IGFBP7', 'CUBN', 'ACSM2A', 'MT1G', 'AFP', 'CLDN4', 'KRT8', 'MAL', 'SLC12A1', 'UMOD', 'TRPM6', 'CNNM2', 'KDR', 'CD34', 'VCAM1', 'CRYAB', 'PLVAP', 'SLC8A1', 'TEX41', 'GATA3', 'AQP2', 'CLNK', 'MYLPF', 'MYL1')
+table(rnaAggr.all.re@active.ident)
+DotPlot(rnaAggr.all.re, features = markergene, cols = c('red', 'grey')) +theme(axis.text.x = element_text(angle = 90))
+StackedVlnPlot(obj = rnaAggr.all.re, features = rev(markergene))
+
+#figure1D
+cellpercent <- read.csv(file = 'clusterpercent.csv', header = T, row.names = 'Sample')
+cp <- cellpercent[,1:4]
+sample <- rep(rownames(cp), 4)
+sample <- sort(sample)
+condition <- rep(colnames(cp), 13)
+value <- t(cp[1:13,])
+value <- c(value[,1], value[,2], value[,3], value[,4], value[,5], value[,6], value[,7], value[,8], value[,9], value[,10], value[,11], value[,12], value[,13])
+data <- data.frame(sample, condition, value)
+ggplot(data, aes(fill=condition, y=value, x=sample)) + 
+  geom_bar(position="fill", stat="identity") + 
+  coord_flip() + 
+  geom_col() + 
+  theme_classic() + 
+  scale_fill_brewer(palette = 'Pastel1')
+
+#figure2A
+##within cluster DE
+
+de <- rnaAggr.all.re
+de@meta.data$SampleCluster <- paste(de@meta.data$SampleType, de@active.ident, sep = '_')
+de[['cluster']] <- Idents(object = de)
+Idents(de) <- de$SampleCluster
+table(de$SampleCluster)
+tibble::rownames_to_column()
+de.a <- subset(de, cells = names(de@active.ident[de$SampleType %in% c('Fetal', 'Org')]))
+de.b <- subset(de, cells = names(de@active.ident[de$SampleType %in% c('Adult', 'Org')]))
+
+#Fetal Vs Org
+plot.data <- AverageExpression(de.a, show.progress = T)
+plot.data <- plot.data$RNA %>%
+  tibble::rownames_to_column("Gene") %>%
+  tidyr::gather(key = "SampleCluster", value = "AvgExp", -Gene) %>%
+  tidyr::separate(SampleCluster, c("SampleType", "Cluster"), sep = "_") %>%
+  mutate(Cluster = factor(as.character(Cluster))) %>%
+  mutate(LogAvgExp = log1p(AvgExp)) %>%
+  select(-AvgExp) %>%
+  tidyr::spread(SampleType, LogAvgExp) %>%
+  tidyr::replace_na(list(Fetal = 0, Org = 0)) %>%
+  mutate(Avg = 0.5 * (Fetal + Org),
+         Diff = Fetal - Org)
+
+ggplot(plot.data, aes(x = Avg, y = Diff)) +
+  geom_hline(yintercept = 0, colour = "red") +
+  geom_point(size = 0.6, alpha = 0.2) +
+  xlab("0.5 * (Fetal + Org)") +
+  ylab("Fetal - Org") +
+  facet_wrap(~ Cluster) + 
+  theme_classic()
+#Adult Vs Org
+plot.data <- AverageExpression(de.b, show.progress = T)
+plot.data <- plot.data$RNA %>%
+  tibble::rownames_to_column("Gene") %>%
+  tidyr::gather(key = "SampleCluster", value = "AvgExp", -Gene) %>%
+  tidyr::separate(SampleCluster, c("SampleType", "Cluster"), sep = "_") %>%
+  mutate(Cluster = factor(as.character(Cluster))) %>%
+  mutate(LogAvgExp = log1p(AvgExp)) %>%
+  select(-AvgExp) %>%
+  tidyr::spread(SampleType, LogAvgExp) %>%
+  tidyr::replace_na(list(Adult = 0, Org = 0)) %>%
+  mutate(Avg = 0.5 * (Adult + Org),
+         Diff = Adult - Org)
+
+ggplot(plot.data, aes(x = Avg, y = Diff)) +
+  geom_hline(yintercept = 0, colour = "red") +
+  geom_point(size = 0.6, alpha = 0.2) +
+  xlab("0.5 * (Adult + Org)") +
+  ylab("Adult - Org") +
+  facet_wrap(~ Cluster) + 
+  theme_classic()
+
+#figure2B and figureS3
+library(gplots)
+rnaAggr.all.re <- FindVariableFeatures(rnaAggr.all.re, selection.method = 'vst', nfeatures = 2000, verbose = F)
+my_palette <-colorRampPalette(c("blue","white","red"))(50)
+#sample subset
+adult <- subset(rnaAggr.all.re, cells = names(rnaAggr.all.re@active.ident[rnaAggr.all.re$orig.ident %in% c('HUM_SN1', 'HUM_SN2', 'HUM_SN3')]))
+Fetal <- subset(rnaAggr.all.re, cells = names(rnaAggr.all.re@active.ident[rnaAggr.all.re$orig.ident %in% c('HUM_WK17', 'HUM_WK13', 'HUM_WK9', 'HUM_WK18')]))
+Org <- subset(rnaAggr.all.re, cells = names(rnaAggr.all.re@active.ident[!rnaAggr.all.re$orig.ident %in% c('HUM_WK17', 'HUM_WK13', 'HUM_WK9', 'HUM_WK18', 'HUM_SN1', 'HUM_SN2', 'HUM_SN3')]))
+org.orig.ident <- c("AY_AS_D29", "COM_D25", "HOW_DAY25", "JH_DAY10", "KUM_D25", "LAW_D25", "VAN_D20")
+a <- Corrheatm(Org, Fetal, 1) #organoid vs Fetal
+#각 sampletype별로 오가노이드 샘플들을 나누어 번호(1-7)로 하나씩 제작함
+par("mar")
+par(mar=c(1,1,1,1))
+heatmap.2(a[1:dim(a)[1],], col = my_palette, keysize = 1, density.info="none", trace="none",cexRow=1,cexCol = 1,
+          breaks=c(seq(-0.7,0.7, length=51) ),Rowv=F, Colv=F, dendrogram="none", margins = c(10,10),
+          colsep=0:(ncol(x)+1),rowsep=0:(nrow(x)+1),sepcolor="black", sepwidth=c(0.01,0.01))
+dev.off()
+
+a <- Corrheatm(Org, Fetal, 7) #orgnanoid vs Adult
+#위와 동일하게 번호를 이용하여 표시함
+par("mar")
+par(mar=c(1,1,1,1))
+
+heatmap.2(a[1:dim(a)[1],], col = my_palette, keysize = 1, density.info="none", trace="none",cexRow=1,cexCol = 1,
+          breaks=c(seq(-0.7,0.7, length=51) ),Rowv=F, Colv=F, dendrogram="none", margins = c(10,10),
+          colsep=0:(ncol(x)+1),rowsep=0:(nrow(x)+1),sepcolor="black", sepwidth=c(0.01,0.01))
+dev.off()
+
+#figure2C
+orig.ident <- c( "AY_AS_D29", "COM_D25", "HOW_DAY25",'HUM_SN1', 'HUM_SN2', 'HUM_SN3', "HUM_WK13", "HUM_WK17", "HUM_WK18", 'HUM_WK9', "JH_DAY10", "KUM_D25", "LAW_D25", "VAN_D20")
+cc.gene <- read.table("/home/qkrtltm100/kidney_organoid_3/CellcycleGene.txt", header = T)
+rnaAggr.all.cc <-CellCycleScoring(rnaAggr.all.re, s.features = cc.gene$G1.S, g2m.features = cc.gene$G2.M) 
+DimPlot(rnaAggr.all.cc, group.by = 'Phase')
+table(rnaAggr.all.cc$Phase)
+freq_table <- data.frame(rm=c('G1', 'G2M', 'S'))
+rownames(freq_table) <- freq_table$rm
+for(i in 1:length(orig.ident)){
+  a <- subset(rnaAggr.all.cc, cells = names(rnaAggr.all.cc@active.ident[rnaAggr.all.cc$orig.ident %in% orig.ident[i]]))
+  b <-as.data.frame(table(a$Phase))
+  b <- b[,2]
+  freq_table <- cbind(freq_table, b)
+}
+
+freq_table <- freq_table[,-1]
+colnames(freq_table) <- orig.ident
+cellcount <- as.data.frame(table(rnaAggr.all.cc$orig.ident))
+cellcount <- cellcount[,2]
+sample <- rep(orig.ident, 3) %>% sort()
+condition <- rep(rownames(freq_table), 14)
+value <- as.integer()
+for(i in 1:length(colnames(freq_table))) {
+  a <- freq_table[,i]
+  a <- ((a/cellcount[i])*100)
+  value <- c(value,a)
+}
+data <- data.frame(sample, condition, value)
+ggplot(data, aes(x = sample, y = value, fill = condition)) + geom_col() + theme_classic() + theme(axis.text.x = element_text(angle = 90)) #CC Proportion each cluster
+
+#figure3A
+#using jupyter notebook called sanpy1.ipynb
+
+#figure3B
+plot_cell_trajectory(HSMM4, color_by = 'State') +NoAxes() #1
+plot_cell_trajectory(HSMM4, color_by = 'orig.ident') +NoAxes() #3
+plot_cell_trajectory(HSMM4, color_by = 'SampleType') +NoAxes() #4
+plot_cell_trajectory(HSMM4, color_by = 'SampleID') +NoAxes() #5
+plot_cell_trajectory(HSMM4, color_by = 'Pseudotime') +NoAxes() #6
+#2
+pData(HSMM4) %>%
+  count(State, SampleID) %>%
+  tidyr::complete(State, SampleID, fill = list(n = 0)) %>%
+  group_by(State) %>%
+  mutate(Total = sum(n)) %>%
+  ggplot(aes(x = SampleID, y = n / Total, fill = State)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~ State, ncol = 1, labeller = label_both) +
+  labs(title = "State by SampleID",
+       x = "SampleID",
+       y = "Percentage of cells in state") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90))
+
+
+#figureS1
+load(file = 'rnaAggr.all.ALL.SN.anno.with.SampleType.RData')
+org <- sum(rnaAggr.all.ALL.SN@meta.data$SampleType == "Org")
+fetal <- sum(rnaAggr.all.ALL.SN@meta.data$SampleType == "Fetal")
+Adult <- sum(rnaAggr.all.ALL.SN@meta.data$SampleType == "Adult")
+rnaAggr.all.ALL.SN[['Celltype']] <- Idents(rnaAggr.all.ALL.SN)
+
+plot.data <- rnaAggr.all.ALL.SN@meta.data %>%
+  select(SampleType, cluster = Celltype) %>%
+  mutate(cluster = factor(as.numeric(cluster))) %>%
+  group_by(cluster, SampleType) %>%
+  summarise(count = n()) %>%
+  mutate(clust_total = sum(count)) %>%
+  mutate(clust_prop = count / clust_total) %>%
+  mutate(SampleType_total = ifelse(SampleType == 'Org', org, ifelse(SampleType == 'Fetal', fetal, Adult))) %>%
+  mutate(SampleType_prop = count / SampleType_total)
+
+ggplot(plot.data, aes(x = cluster, y = count, fill = SampleType)) + geom_col() + theme_classic() #A: Cell count each seurat_cluster
+ggplot(plot.data, aes(x = cluster, y = clust_prop, fill = SampleType)) + geom_col() + theme_classic() #B: Cell Proportion each cluster
+ggplot(plot.data, aes(x = cluster, y = SampleType_prop, fill = SampleType)) + 
+  geom_col(position = position_dodge(0.9)) + theme_classic() #C: sampletype별 cell prop in each cluster
+
+#figureS2
+#Fet only
+fet_only <- load(file = 'rnaAggr.all.fet.only.anno.RData')
+DimPlot(fet_only, group.by = 'orig.ident') + DimPlot(fet_only, label = T, label.size = 3)
+#Org_only
+org_only <- load(file = 'rnaAggr.all.org.only.anno.RData')
+DimPlot(org_only, group.by = 'orig.ident') + DimPlot(org_only, label = T, label.size = 3)
+#Adult only
+ad_only <- load(file = 'rnaAggr.ALL.SN.RData')
+DimPlot(ad_only, label = T, label.size = 3) + DimPlot(ad_only, group.by = 'orig.ident') 
+
+
+#figureS4
+load(file = 'rnaAggr.ALL.SN.monocle.RData')
+
+plot.genes <- c("CDH5", "MEIS1", "PDGFRA", "HMGB2", "CENPA", "SIX1",
+                "DAPL1", "NPHS1", "PODXL", "S100A8", "TYROBP", "MAL", "EMX2",
+                "LRP2", "GATA3", "SLC12A1", "SPINT2", "TUBB2B", "STMN2", "HBA1", "HBG1")
+
+is_present <- plot.genes %in% rownames(HSMM4)
+isp <- markergene %in% rownames(HSMM4)
+is_exprs <- fData(HSMM4)[plot.genes[is_present], "ExprsCells"] > 10
+plot.genes.use <- plot.genes[is_present][is_exprs]
+plot_genes_in_pseudotime(HSMM4[markergene,], ncol = 3, color_by = 'State')
+dev.off()
